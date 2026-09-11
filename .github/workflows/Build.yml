@@ -99,6 +99,9 @@ jobs:
         run: |
           cd kernel_workspace/common/arch/arm64/configs
           {
+            echo "CONFIG_KPROBES=y"
+            echo "CONFIG_HAVE_KPROBES=y"
+            echo "CONFIG_KPROBE_EVENTS=y"
             echo "CONFIG_KSU=y"
             echo "CONFIG_KSU_SUSFS=y"
             echo "CONFIG_KSU_SUSFS_SUS_PATH=y"
