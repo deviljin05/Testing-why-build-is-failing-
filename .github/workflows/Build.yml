@@ -42,7 +42,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y git curl bc bison flex libssl-dev \
             build-essential python3 python3-pip libncurses-dev \
-            ccache zip unzip device-tree-compiler
+            ccache zip unzip device-tree-compiler \
+            clang llvm lld \
+            binutils-aarch64-linux-gnu gcc-aarch64-linux-gnu
 
       - name: Install repo tool
         run: |
@@ -336,7 +338,7 @@ jobs:
           export PATH="/usr/lib/ccache:$PATH"
           
           # Generate defconfig
-          make -j"$(nproc)" O="$(pwd)/out" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC=clang CLANG_TRIPLE=aarch64-linux-gnu- gki_defconfig
+          make -j"$(nproc)" O="$(pwd)/out" gki_defconfig
           
           # Build kernel
-          make -j"$(nproc)" O="$(pwd)/out" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC=clang CLANG_TRIPLE=aarch64-linux-gnu-
+          make -j"$(nproc)" O="$(pwd)/out"
