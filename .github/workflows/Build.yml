@@ -8,9 +8,9 @@ on:
         required: true
         default: "lts"
       susfs_commit:
-        description: "SUSFS commit hash (leave empty = latest on gki-android12-5.10 branch)"
+        description: "SUSFS commit hash on gki-android12-5.10 branch. Pinned by default to a known-working commit — see comment in workflow file."
         required: false
-        default: ""
+        default: "ec785f4"
       device_name:
         description: "Optional label for artifact naming"
         required: false
@@ -138,6 +138,16 @@ jobs:
           set -euo pipefail
           git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-android12-5.10 susfs4ksu
           cd susfs4ksu
+          # Pinned by default (see workflow_dispatch input above): the raw
+          # branch HEAD periodically ships the main SUSFS patch slightly
+          # out of sync with its own headers, which shows up at build time
+          # as e.g. "implicit declaration of function
+          # 'susfs_sus_kstat_spoof_vfs_statfs'" in fs/statfs.c — the patch
+          # calls a helper that the header copy at that HEAD doesn't
+          # declare yet. The default commit here is one WildKernels'
+          # own CI has confirmed builds cleanly for gki-android12-5.10 with
+          # ReSukiSU. Override the susfs_commit input if you need a newer
+          # commit once SUSFS upstream re-syncs.
           if [ -n "${{ github.event.inputs.susfs_commit }}" ]; then
             git checkout "${{ github.event.inputs.susfs_commit }}"
           fi
@@ -379,61 +389,151 @@ jobs:
             echo "CONFIG_NET_SCH_CAKE=y"
           } >> gki_defconfig
 
-      - name: Set ZRAM compression (LZ4HC)
-        run: |
-          cd kernel_workspace/common/arch/arm64/configs
-          {
-            echo "CONFIG_ZRAM=y"
-            echo "CONFIG_ZSMALLOC=y"
-            echo "CONFIG_CRYPTO_LZ4HC=y"
-            echo "CONFIG_ZRAM_DEF_COMP_LZ4HC=y"
-            echo 'CONFIG_ZRAM_DEF_COMP="lz4hc"'
-          } >> gki_defconfig
-
-      - name: Set IO scheduler to none
-        run: |
-          cd kernel_workspace/common/arch/arm64/configs
-          {
-            echo "CONFIG_MQ_IOSCHED_NONE=y"
-            echo "# CONFIG_MQ_IOSCHED_DEADLINE is not set"
-            echo "# CONFIG_MQ_IOSCHED_KYBER is not set"
-            echo "# CONFIG_IOSCHED_BFQ is not set"
-          } >> gki_defconfig
-
-      - name: Set memory management optimization configs
-        run: |
-          cd kernel_workspace/common/arch/arm64/configs
-          {
-            echo "CONFIG_KSM=y"
-            echo "CONFIG_ZRAM_WRITEBACK=y"
-            echo "CONFIG_COMPACTION=y"
-            echo "CONFIG_MIGRATION=y"
-            echo "CONFIG_PAGE_REPORTING=y"
-          } >> gki_defconfig
-
-      - name: Set writeback (dirty ratio) tuning in source
+      # ---------------------------------------------------------------
+      # Container runtime support (DroidSpaces-OSS: ravindu644/Droidspaces-OSS
+      # is a userspace app, not a kernel patch — but a few of the kernel
+      # options it needs are dangerous on GKI if enabled the naive way.
+      #
+      # IMPORTANT: on GKI, turning on CONFIG_SYSVIPC / CONFIG_IPC_NS /
+      # CONFIG_POSIX_MQUEUE directly shifts offsets inside task_struct,
+      # which breaks kABI and WILL bootload/crash stock vendor modules
+      # (GPU, camera, etc.) because they're precompiled against the
+      # unmodified struct layout. Droidspaces' own docs are explicit that
+      # this is NOT OPTIONAL: you must apply their kABI-safe patches
+      # first, which pad the struct instead of shifting it, and only then
+      # is it safe to flip these configs on. Source:
+      # https://github.com/ravindu644/Droidspaces-OSS/blob/main/Documentation/Kernel-Configuration.md
+      # ---------------------------------------------------------------
+      - name: Apply DroidSpaces kABI-safe patches (required before enabling SYSVIPC/IPC_NS/POSIX_MQUEUE on GKI)
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
-          if grep -q "int vm_dirty_ratio = 20;" mm/page-writeback.c; then
-            sed -i 's/int vm_dirty_ratio = 20;/int vm_dirty_ratio = 10;/' mm/page-writeback.c
-          fi
-          if grep -q "unsigned int dirty_background_ratio = 10;" mm/page-writeback.c; then
-            sed -i 's/unsigned int dirty_background_ratio = 10;/unsigned int dirty_background_ratio = 5;/' mm/page-writeback.c
+          BASE="https://raw.githubusercontent.com/ravindu644/Droidspaces-OSS/main/Documentation/resources/kernel-patches/GKI/below-kernel-6.12"
+
+          curl -fLSs -o /tmp/001-sysvipc-kabi.patch \
+            "${BASE}/001.GKI-below-6.12-fix_sysvipc_kabi_6_7_8.patch"
+          if ! patch -p1 < /tmp/001-sysvipc-kabi.patch; then
+            echo "::error::SYSVIPC kABI patch (6_7_8 variant) failed to apply. DroidSpaces' docs note alternate variants (1_2_3 / 3_4_5) exist in the same folder for kernels where this one doesn't fit — you may need to try one of those by hand. NOT applying this patch means CONFIG_SYSVIPC/IPC_NS must stay OFF to avoid a bootloop, so failing the build here rather than silently shipping an unsafe config."
+            find . -name "*.rej"
+            exit 1
           fi
 
-      - name: Set storage (F2FS/EXT4) optimization configs
+          # 5.10 and below also need the POSIX_MQUEUE kABI padding fix
+          curl -fLSs -o /tmp/002-posix-mqueue-kabi.patch \
+            "${BASE}/002.5.10_or_lower_use_android_abi_padding_for_posix_mqueue.patch"
+          if ! patch -p1 < /tmp/002-posix-mqueue-kabi.patch; then
+            echo "::error::POSIX_MQUEUE kABI patch failed to apply — leaving CONFIG_POSIX_MQUEUE off would be required without it."
+            find . -name "*.rej"
+            exit 1
+          fi
+
+      # This is deliberately the small "GKI-Exclusive Configuration" list
+      # from DroidSpaces' own docs, not their full non-GKI config block —
+      # their docs explicitly warn not to enable anything beyond this set
+      # on GKI, since only these have been verified kABI-safe together
+      # with the two patches above.
+      - name: Set DroidSpaces GKI-exclusive kernel configs
         run: |
           cd kernel_workspace/common/arch/arm64/configs
           {
-            echo "CONFIG_F2FS_FS=y"
-            echo "CONFIG_F2FS_FS_COMPRESSION=y"
-            echo "CONFIG_F2FS_FS_LZ4=y"
-            echo "CONFIG_F2FS_FS_LZ4HC=y"
-            echo "CONFIG_F2FS_FS_ZSTD=y"
-            echo "CONFIG_EXT4_FS=y"
-            echo "CONFIG_EXT4_USE_FOR_EXT2=y"
+            # IPC (safe now that the kABI patches above are applied)
+            echo "CONFIG_SYSVIPC=y"
+            echo "CONFIG_POSIX_MQUEUE=y"
+            # Namespaces
+            echo "CONFIG_IPC_NS=y"
+            echo "CONFIG_PID_NS=y"
+            echo "CONFIG_UTS_NS=y"
+            echo "CONFIG_NET_NS=y"
+            echo "CONFIG_NAMESPACES=y"
+            # HW access
+            echo "CONFIG_DEVTMPFS=y"
+            # Enhanced NAT support
+            echo "CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y"
+            # --- optional but recommended, per DroidSpaces docs ---
+            echo "CONFIG_USER_NS=y"
+            echo "CONFIG_CGROUPS=y"
+            echo "CONFIG_CGROUP_DEVICE=y"
+            echo "CONFIG_CGROUP_PIDS=y"
+            echo "CONFIG_CGROUP_FREEZER=y"
+            echo "CONFIG_MEMCG=y"
+            echo "CONFIG_OVERLAY_FS=y"
+            echo "CONFIG_VETH=y"
+            echo "CONFIG_BRIDGE=y"
+            # tmpfs xattr/acl — also required by the Mountify metamodule
+            echo "CONFIG_TMPFS_POSIX_ACL=y"
+            echo "CONFIG_TMPFS_XATTR=y"
+            # Optional: UFW support inside a container
+            echo "CONFIG_NETFILTER_XT_TARGET_REJECT=y"
+            echo "CONFIG_NETFILTER_XT_TARGET_LOG=y"
+            echo "CONFIG_NETFILTER_XT_MATCH_RECENT=y"
+            # Optional: Fail2ban support inside a container
+            echo "CONFIG_IP_SET=y"
+            echo "CONFIG_IP_SET_HASH_IP=y"
+            echo "CONFIG_IP_SET_HASH_NET=y"
+            echo "CONFIG_NETFILTER_XT_SET=y"
           } >> gki_defconfig
+
+      # ---------------------------------------------------------------
+      # BTF / eBPF / FUSE-BPF. BPF itself is standard mainline Kconfig on
+      # every android12-5.10 sublevel, so those two lines are always safe.
+      # CONFIG_FUSE_BPF is only a real Kconfig symbol on branches where
+      # Google/AOSP's fuse-bpf feature patch has been merged into fs/fuse —
+      # it isn't guaranteed present on android12-5.10. We check for it and
+      # only set it if the symbol actually exists, so this can't silently
+      # do nothing without you knowing.
+      # ---------------------------------------------------------------
+      - name: Set BTF / eBPF configs
+        run: |
+          cd kernel_workspace/common/arch/arm64/configs
+          {
+            echo "CONFIG_BPF=y"
+            echo "CONFIG_BPF_SYSCALL=y"
+            echo "CONFIG_BPF_JIT=y"
+            echo "CONFIG_BPF_JIT_ALWAYS_ON=y"
+            echo "CONFIG_DEBUG_INFO_BTF=y"
+            echo "CONFIG_DEBUG_INFO_BTF_MODULES=y"
+            echo "CONFIG_CGROUP_BPF=y"
+            echo "CONFIG_NETFILTER_XT_MATCH_BPF=y"
+          } >> gki_defconfig
+
+      - name: Check for FUSE-BPF support
+        working-directory: kernel_workspace/common
+        run: |
+          set -euo pipefail
+          if grep -rq "FUSE_BPF" fs/fuse/Kconfig 2>/dev/null; then
+            echo "CONFIG_FUSE_BPF=y" >> arch/arm64/configs/gki_defconfig
+            echo "FUSE_BPF Kconfig symbol found, enabled it."
+          else
+            echo "::warning::CONFIG_FUSE_BPF is not a Kconfig option on this kernel/common checkout (fs/fuse has no FUSE_BPF symbol). This branch of android12-5.10 doesn't carry Google's fuse-bpf backport, so FUSE-BPF cannot be enabled without adding that patch series separately. Regular BPF/BTF are still enabled above."
+          fi
+
+      # ---------------------------------------------------------------
+      # Ptrace Leak Fix + Unicode Fix — root-hiding patches from
+      # WildKernels/kernel_patches, applied fail-soft (warn on reject,
+      # don't hard-fail the build) since context drift is possible.
+      # ---------------------------------------------------------------
+      - name: Apply Ptrace Leak Fix patch
+        working-directory: kernel_workspace/common
+        run: |
+          set -euo pipefail
+          curl -LSs -o /tmp/gki_ptrace.patch \
+            https://raw.githubusercontent.com/WildKernels/kernel_patches/main/gki_ptrace.patch
+          patch -p1 < /tmp/gki_ptrace.patch || {
+            echo "::warning::Ptrace Leak Fix patch had rejects"
+            find . -name "*.rej"
+          }
+
+      - name: Apply Unicode Fix patch
+        working-directory: kernel_workspace/common
+        run: |
+          set -euo pipefail
+          # android12-5.10 predates the 6.1 branch, so use the "6.1-" variant
+          curl -LSs -o /tmp/unicode_bypass_fix.patch \
+            "https://raw.githubusercontent.com/WildKernels/kernel_patches/main/common/unicode_bypass_fix_6.1-.patch"
+          patch -p1 < /tmp/unicode_bypass_fix.patch || {
+            echo "::warning::Unicode Fix patch had rejects"
+            find . -name "*.rej"
+          }
 
       - name: Apply NTSync patches
         working-directory: kernel_workspace/common
