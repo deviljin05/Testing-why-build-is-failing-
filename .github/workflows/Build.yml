@@ -1,4 +1,4 @@
-name: Build Custom GKI Kernel (ReSuKisu dev + SUSFS + BBRv3)
+name: Build Custom GKI Kernel (ReSuKisu + SUSFS + BBRv3)
 
 on:
   workflow_dispatch:
@@ -147,12 +147,12 @@ jobs:
           if [ "${SUBLEVEL}" -le "117" ]; then
             perl -i -pe 's/^(s+if (inode) {)/$1
           \t\t/*
-           \t\t * IN_ALL_EVENTS represents all of the mask bits
-           \t\t * that we expose to userspace.  There is at
-            \t\t * least one bit (FS_EVENT_ON_CHILD) which is
-            \t\t * used only internally to the kernel.
-             \t\t */
-             \t\tu32 mask = mark->mask & IN_ALL_EVENTS;/m' fs/notify/fdinfo.c
+          \t\t * IN_ALL_EVENTS represents all of the mask bits
+          \t\t * that we expose to userspace.  There is at
+          \t\t * least one bit (FS_EVENT_ON_CHILD) which is
+          \t\t * used only internally to the kernel.
+          \t\t */
+          \t\tu32 mask = mark->mask & IN_ALL_EVENTS;/m' fs/notify/fdinfo.c
             perl -i -pe 's/\binotify_mark_user_mask(mark)/mask, mark->ignored_mask/g' fs/notify/fdinfo.c
             perl -i -pe 's/ignored_mask:0/ignored_mask:%x/g' fs/notify/fdinfo.c
           fi
@@ -164,11 +164,11 @@ jobs:
             sed -i -e 's/goto show_pad;/return 0;/' ./fs/proc/task_mmu.c
           fi
 
-      - name: Setup ReSuKisu (dev branch – latest testing)
+      - name: Setup ReSuKisu (main branch – latest, Sep 12, 2026)
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
-          curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/dev/kernel/setup.sh" | bash
+          curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash
           ls -d KernelSU* 2>/dev/null || echo "::warning::no KernelSU* directory found"
 
       - name: Install Baseband Guard (BBG)
@@ -332,33 +332,3 @@ jobs:
           set -euo pipefail
           cd out/android12-5.10/common
           make -j"$(nproc)" LLVM=1 LLVM_IAS=1 DEPMOD=depmod DTC=dtc O=/home/runner/work/Testing-why-build-is-failing-/Testing-why-build-is-failing-/kernel_workspace/out/android12-5.10/common
-
-      - name: Locate built Image
-        working-directory: kernel_workspace
-        run: |
-          set -euo pipefail
-          IMG=$(find out -path "*dist/Image" | head -n1)
-          if [ -z "$IMG" ]; then
-            IMG=$(find out -name "Image" | head -n1)
-          fi
-          if [ -z "$IMG" ]; then
-            echo "::error::No kernel Image found anywhere under kernel_workspace/out — build failed above"
-            exit 1
-          fi
-          echo "Found Image at: $IMG"
-          echo "IMG_PATH=kernel_workspace/${IMG}" >> "$GITHUB_ENV"
-
-      - name: Package AnyKernel3
-        run: |
-          set -euo pipefail
-          git clone --depth=1 https://github.com/WildKernels/AnyKernel3.git -b gki-2.0 ak3
-          cp "${{ env.IMG_PATH }}" ak3/Image
-          cd ak3
-          zip -r9 -q "../${{ github.event.inputs.device_name }}-Blaze-android12-5.10-susfs${SUSFS_COMMIT:0:8}.zip" . -x ".git*"
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ github.event.inputs.device_name }}-build
-          path: "*.zip"
-          retention-days: 14
