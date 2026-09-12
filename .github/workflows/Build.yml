@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       os_patch_level:
-        description: "Kernel branch tag — 'lts' tracks the rolling LTS branch (recommended)"
+        description: "'lts' = rolling common-android12-5.10 branch (recommended). Or give an exact tag (e.g. android12-5.10.264_r00) or a dated maintenance branch (e.g. android12-5.10-2026-07)."
         required: true
         default: "lts"
       susfs_commit:
@@ -19,6 +19,14 @@ on:
         description: "Enable Baseband Guard (BBG)"
         required: true
         default: "true"
+      kernel_lto:
+        description: "LTO mode for the build (thin is strongly recommended on GitHub-hosted runners; full LTO can OOM/timeout)"
+        required: true
+        default: "thin"
+        type: choice
+        options:
+          - thin
+          - none
 
 env:
   VERSION: android12-5.10
@@ -40,9 +48,10 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y git curl bc bison flex libssl-dev \
+          sudo apt-get install -y git curl wget bc bison flex libssl-dev \
             build-essential python3 python3-pip libncurses-dev \
-            ccache zip unzip device-tree-compiler \
+            ccache zip unzip rsync cpio kmod libelf-dev dwarves \
+            device-tree-compiler \
             clang llvm lld \
             binutils-aarch64-linux-gnu gcc-aarch64-linux-gnu
 
@@ -58,12 +67,63 @@ jobs:
       - name: Set up ccache
         run: mkdir -p "${{ env.CCACHE_DIR }}"
 
+      # ---------------------------------------------------------------
+      # NOTE ON BRANCH NAMES:
+      # The manifest repo only ever exposes the rolling branch as
+      # "common-android12-5.10" — there is NO "common-android12-5.10-lts"
+      # branch, so appending the raw "lts" input straight into the repo
+      # init branch name (as the original workflow did) fails with
+      # "couldn't find remote ref". Dated maintenance branches
+      # (android12-5.10-YYYY-MM) and release tags only exist inside the
+      # kernel/common project itself, not the manifest repo. So: always
+      # init/sync the generic rolling manifest branch, then, if the user
+      # asked for something more specific than "lts", check kernel/common
+      # out to that exact tag or dated branch afterwards.
+      # ---------------------------------------------------------------
       - name: Sync GKI kernel source
         run: |
+          set -euo pipefail
           mkdir kernel_workspace && cd kernel_workspace
           repo init -u https://android.googlesource.com/kernel/manifest \
-            -b common-${{ env.VERSION }}-${{ github.event.inputs.os_patch_level }} --depth=1
+            -b common-${{ env.VERSION }} --depth=1
           repo sync -c --current-branch --no-clone-bundle --no-tags -j"$(nproc)"
+
+      - name: Pin kernel/common to requested tag or branch (if not lts)
+        working-directory: kernel_workspace/common
+        run: |
+          set -euo pipefail
+          REQUESTED="${{ github.event.inputs.os_patch_level }}"
+          if [ "$REQUESTED" != "lts" ] && [ -n "$REQUESTED" ]; then
+            echo "Fetching and checking out kernel/common ref: $REQUESTED"
+            git fetch --depth=1 origin "$REQUESTED" || {
+              echo "::error::Could not find '$REQUESTED' as a tag or branch in kernel/common. Use 'lts', an exact release tag (e.g. android12-5.10.264_r00), or a dated maintenance branch (e.g. android12-5.10-2026-07)."
+              exit 1
+            }
+            git checkout FETCH_HEAD
+          else
+            echo "Using rolling lts branch as synced (no pin requested)."
+          fi
+
+      # ---------------------------------------------------------------
+      # Ubuntu's apt clang/llvm package ships ld.lld but not a plain "ld"
+      # binary. Several host-side build tools invoked during "make
+      # prepare" (SELinux's genheaders, which generates flask.h /
+      # av_permissions.h — needed regardless of BBG since LSM selection
+      # touches security/Kconfig) look for a bare "ld" on PATH and fail
+      # with "clang: error: invalid linker name in argument '-fuse-ld=ld'"
+      # or "Executable \"ld\" doesn't exist". Symlinking ld -> ld.lld
+      # fixes this. Must run before any make invocation.
+      # ---------------------------------------------------------------
+      - name: Ensure generic "ld" exists for host tool builds
+        run: |
+          set -euo pipefail
+          LLD_PATH="$(command -v ld.lld)"
+          if [ -z "$LLD_PATH" ]; then
+            echo "::error::ld.lld not found on PATH after installing llvm/lld"
+            exit 1
+          fi
+          sudo ln -sf "$LLD_PATH" /usr/local/bin/ld
+          ld --version
 
       - name: Detect kernel sublevel
         working-directory: kernel_workspace/common
@@ -83,53 +143,82 @@ jobs:
           fi
           echo "SUSFS_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
 
-      - name: Set SUSFS kernel configs
-        run: |
-          cd kernel_workspace/common/arch/arm64/configs
-          {
-            echo "CONFIG_KSU=y"
-            echo "CONFIG_KSU_SUSFS=y"
-            echo "CONFIG_KSU_SUSFS_SUS_PATH=y"
-            echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y"
-            echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y"
-            echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y"
-            echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y"
-            echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y"
-            echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y"
-            echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y"
-            echo "CONFIG_KSU_SUSFS_SUS_MAP=y"
-            echo "CONFIG_KSU_SUSFS_SUS_SU=y"
-            echo "CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y"
-            echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSUD=y"
-          } >> gki_defconfig
+          echo "Verifying SUSFS files..."
+          ls -la kernel_patches/fs/
+          ls -la kernel_patches/include/linux/
+          echo "Patch files present in this SUSFS branch:"
+          ls -la kernel_patches/*.patch
 
       - name: Copy SUSFS kernel patches
         run: |
+          set -euo pipefail
           cd kernel_workspace/common
-          cp ../susfs4ksu/kernel_patches/fs/* ./fs/
-          cp ../susfs4ksu/kernel_patches/include/linux/* ./include/linux/
-          cp ../susfs4ksu/kernel_patches/50_add_susfs_in_gki-android12-5.10.patch ./
+
+          echo "Copying SUSFS fs files..."
+          cp -v ../susfs4ksu/kernel_patches/fs/* ./fs/
+
+          echo "Copying SUSFS header files..."
+          cp -v ../susfs4ksu/kernel_patches/include/linux/* ./include/linux/
+
+          # Copy every top-level patch shipped by this SUSFS branch, not just
+          # the main 50_ one — some branches also ship a required follow-up
+          # patch (e.g. 60_scope-minimized_manual_hooks.patch). Copying/
+          # applying all of them, sorted, keeps this working automatically
+          # if SUSFS adds more required patches for android12-5.10 later.
+          cp -v ../susfs4ksu/kernel_patches/*.patch ./
+
+          echo "Verifying copied files..."
+          ls -la fs/statfs.c
+          ls -la include/linux/susfs.h
 
       - name: Apply android12-5.10 pre-patch compatibility fixes
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
           if [ "${SUBLEVEL}" -le "43" ]; then
-            perl -i -pe 's/(int|size_t)s+this_lens*=s*min_ts*(s*\u0001s*,/size_t this_len = min_t(size_t,/' fs/proc/base.c
+            if grep -qP '(int|size_t)\s+this_len\s*=\s*min_t\(\s*int\s*,' fs/proc/base.c; then
+              perl -i -pe 's/(int|size_t)\s+this_len\s*=\s*min_t\(\s*int\s*,/size_t this_len = min_t(size_t,/' fs/proc/base.c
+            else
+              echo "::warning::this_len/min_t pattern not found in fs/proc/base.c, skipping SUBLEVEL<=43 fix"
+            fi
           fi
           if [ "${SUBLEVEL}" -le "117" ]; then
-            sed -i '/^[[:space:]]*/*$/,/^[[:space:]]*u32 mask = mark->mask & IN_ALL_EVENTS;$/d' fs/notify/fdinfo.c
-            perl -i -pe 's/\bmask,s*mark->ignored_mask/inotify_mark_user_mask(mark)/g' fs/notify/fdinfo.c
-            perl -i -pe 's/ignored_mask:%x/ignored_mask:0/g' fs/notify/fdinfo.c
+            if grep -q 'u32 mask = mark->mask & IN_ALL_EVENTS;' fs/notify/fdinfo.c; then
+              perl -0777 -i -pe 's/\/\*.*?u32 mask = mark->mask & IN_ALL_EVENTS;\n//s' fs/notify/fdinfo.c
+              perl -i -pe 's/\bmask,\s*mark->ignored_mask/inotify_mark_user_mask(mark)/g' fs/notify/fdinfo.c
+              perl -i -pe 's/ignored_mask:%x/ignored_mask:0/g' fs/notify/fdinfo.c
+            else
+              echo "::warning::IN_ALL_EVENTS pattern not found in fs/notify/fdinfo.c, skipping SUBLEVEL<=117 fix"
+            fi
           fi
 
-      - name: Apply SUSFS kernel patch
+      - name: Apply SUSFS kernel patches
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
-          if ! patch -p1 --fuzz=3 < 50_add_susfs_in_gki-android12-5.10.patch; then
-            echo "::error::SUSFS patch failed to apply cleanly"
-            find . -name "*.rej"
+          shopt -s nullglob
+          patches=(*.patch)
+          if [ "${#patches[@]}" -eq 0 ]; then
+            echo "::error::No SUSFS patch files found to apply"
+            exit 1
+          fi
+          # Sort so 50_... applies before 60_... etc.
+          IFS=$'\n' sorted=($(sort <<<"${patches[*]}")); unset IFS
+          for p in "${sorted[@]}"; do
+            echo "Applying $p"
+            if ! patch -p1 --fuzz=3 < "$p"; then
+              echo "::error::$p failed to apply cleanly"
+              find . -name "*.rej"
+              exit 1
+            fi
+          done
+
+      - name: Verify SUSFS patch applied cleanly
+        working-directory: kernel_workspace/common
+        run: |
+          set -euo pipefail
+          if ! grep -q "susfs" fs/statfs.c; then
+            echo "::error::SUSFS hooks missing from fs/statfs.c after patching"
             exit 1
           fi
 
@@ -144,19 +233,16 @@ jobs:
         run: |
           set -euo pipefail
           if [ "${SUBLEVEL}" -le "43" ]; then
-            sed -i 's/^size_t this_len = min_t(size_t, count, PAGE_SIZE);$/int this_len = min_t(int, count, PAGE_SIZE);/' fs/proc/base.c
+            if grep -q '^size_t this_len = min_t(size_t, count, PAGE_SIZE);$' fs/proc/base.c; then
+              sed -i 's/^size_t this_len = min_t(size_t, count, PAGE_SIZE);$/int this_len = min_t(int, count, PAGE_SIZE);/' fs/proc/base.c
+            fi
           fi
           if [ "${SUBLEVEL}" -le "117" ]; then
-            perl -i -pe 's/^(s+if (inode) {)/$1
-          \t\t/*
-          \t\t * IN_ALL_EVENTS represents all of the mask bits
-          \t\t * that we expose to userspace.  There is at
-          \t\t * least one bit (FS_EVENT_ON_CHILD) which is
-          \t\t * used only internally to the kernel.
-          \t\t */
-          \t\tu32 mask = mark->mask & IN_ALL_EVENTS;/m' fs/notify/fdinfo.c
-            perl -i -pe 's/\binotify_mark_user_mask(mark)/mask, mark->ignored_mask/g' fs/notify/fdinfo.c
-            perl -i -pe 's/ignored_mask:0/ignored_mask:%x/g' fs/notify/fdinfo.c
+            if grep -q 'inotify_mark_user_mask(mark)' fs/notify/fdinfo.c; then
+              perl -i -pe 's/\binotify_mark_user_mask\(mark\)/mask, mark->ignored_mask/g' fs/notify/fdinfo.c
+              perl -i -pe 's/ignored_mask:0/ignored_mask:%x/g' fs/notify/fdinfo.c
+              perl -i -pe 's/^(\s+if \(inode\) \{)$/$1\n\t\tu32 mask = mark->mask & IN_ALL_EVENTS;/' fs/notify/fdinfo.c
+            fi
           fi
 
       - name: Apply SUSFS show_pad fix (older sublevels only)
@@ -166,12 +252,53 @@ jobs:
             sed -i -e 's/goto show_pad;/return 0;/' ./fs/proc/task_mmu.c
           fi
 
-      - name: Setup ReSuKisu (main branch – latest, Sep 12, 2026)
+      - name: Setup ReSuKisu (main branch)
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
           curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash
           ls -d KernelSU* 2>/dev/null || echo "::warning::no KernelSU* directory found"
+
+      # ReSuKisu's own setup.sh only clones the driver and wires up the
+      # Makefile/Kconfig include — it does NOT flip CONFIG_KSU or any of
+      # the SUSFS feature configs on for you, and the patched-in KernelSU
+      # Kbuild also hard-errors at "make mrproper" time (before any
+      # .config exists) if CONFIG_KSU_SUSFS isn't visible yet. Handle
+      # both here, defensively (no-ops if the file/line isn't present).
+      - name: Neutralize KernelSU pre-config Kbuild hard-check
+        working-directory: kernel_workspace/common
+        run: |
+          set -euo pipefail
+          KBUILD="drivers/kernelsu/Kbuild"
+          if [ -f "$KBUILD" ] && grep -q '\$(error "KernelSU requires' "$KBUILD"; then
+            sed -i '/\$(error "KernelSU requires/d' "$KBUILD"
+            echo "Removed pre-config hard error line from $KBUILD"
+          else
+            echo "No matching hard-check line found, nothing to do"
+          fi
+
+      - name: Enable KernelSU + SUSFS config
+        run: |
+          cd kernel_workspace/common/arch/arm64/configs
+          {
+            echo "CONFIG_KSU=y"
+            echo "CONFIG_KSU_SUSFS=y"
+            echo "CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y"
+            echo "CONFIG_KSU_SUSFS_SUS_PATH=y"
+            echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y"
+            echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y"
+            echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y"
+            echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y"
+            echo "CONFIG_KSU_SUSFS_SUS_OVERLAYFS=n"
+            echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y"
+            echo "CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y"
+            echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y"
+            echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y"
+            echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y"
+            echo "CONFIG_KSU_SUSFS_SPOOF_PROC_CMDLINE=y"
+            echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y"
+            echo "# CONFIG_KSU_SUSFS_SUS_SU is not set"
+          } >> gki_defconfig
 
       - name: Install Baseband Guard (BBG)
         if: ${{ github.event.inputs.enable_bbg == 'true' }}
@@ -328,6 +455,29 @@ jobs:
 
           echo "CONFIG_NTSYNC=y" >> arch/arm64/configs/gki_defconfig
 
+      # ReSuKisu's own docs explicitly warn that full LTO can fail to
+      # link on machines without a lot of RAM — GitHub-hosted runners are
+      # exactly that case. Force thin LTO (or disable LTO) instead of
+      # whatever the stock gki_defconfig ships.
+      - name: Set LTO mode
+        run: |
+          cd kernel_workspace/common/arch/arm64/configs
+          sed -i '/CONFIG_LTO/d' gki_defconfig
+          if [ "${{ github.event.inputs.kernel_lto }}" = "none" ]; then
+            {
+              echo "CONFIG_LTO_NONE=y"
+              echo "# CONFIG_LTO_CLANG_FULL is not set"
+              echo "# CONFIG_LTO_CLANG_THIN is not set"
+            } >> gki_defconfig
+          else
+            {
+              echo "CONFIG_LTO_CLANG=y"
+              echo "CONFIG_LTO_CLANG_THIN=y"
+              echo "# CONFIG_LTO_CLANG_FULL is not set"
+              echo "# CONFIG_LTO_NONE is not set"
+            } >> gki_defconfig
+          fi
+
       - name: Build kernel
         working-directory: kernel_workspace/common
         run: |
@@ -336,9 +486,47 @@ jobs:
           export CROSS_COMPILE=aarch64-linux-gnu-
           export CCACHE_DIR="${{ env.CCACHE_DIR }}"
           export PATH="/usr/lib/ccache:$PATH"
-          
-          # Generate defconfig
-          make -j"$(nproc)" O="$(pwd)/out" gki_defconfig
-          
-          # Build kernel
-          make -j"$(nproc)" O="$(pwd)/out"
+          export CC="ccache clang"
+          export LLVM=1
+          export LLVM_IAS=1
+
+          make -j"$(nproc)" O="$(pwd)/out" ARCH=arm64 CC="$CC" LLVM=1 LLVM_IAS=1 gki_defconfig
+          make -j"$(nproc)" O="$(pwd)/out" ARCH=arm64 CC="$CC" LLVM=1 LLVM_IAS=1
+
+      - name: Verify build output
+        working-directory: kernel_workspace/common/out
+        run: |
+          set -euo pipefail
+          IMAGE_PATH=""
+          for candidate in arch/arm64/boot/Image arch/arm64/boot/Image.gz arch/arm64/boot/Image.lz4; do
+            if [ -f "$candidate" ]; then
+              IMAGE_PATH="$candidate"
+              break
+            fi
+          done
+          if [ -z "$IMAGE_PATH" ]; then
+            echo "::error::No kernel Image found under arch/arm64/boot/ after build"
+            exit 1
+          fi
+          echo "Found kernel image: $IMAGE_PATH"
+          echo "IMAGE_PATH=${IMAGE_PATH}" >> "$GITHUB_ENV"
+
+      - name: Package as AnyKernel3 flashable zip
+        run: |
+          set -euo pipefail
+          git clone --depth=1 https://github.com/Kernel-SU/AnyKernel3.git /tmp/AnyKernel3 \
+            || git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git /tmp/AnyKernel3
+          rm -rf /tmp/AnyKernel3/.git
+          cp "kernel_workspace/common/out/${IMAGE_PATH}" /tmp/AnyKernel3/Image
+          cd /tmp/AnyKernel3
+          zip -r9 "${GITHUB_WORKSPACE}/${{ github.event.inputs.device_name }}-kernel.zip" . -x ".git*"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.event.inputs.device_name }}-${{ env.VERSION }}
+          path: |
+            ${{ github.workspace }}/*.zip
+            kernel_workspace/common/out/arch/arm64/boot/Image*
+            kernel_workspace/common/out/vmlinux
+          if-no-files-found: error
