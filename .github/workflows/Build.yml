@@ -64,9 +64,9 @@ jobs:
           repo sync -c --current-branch --no-clone-bundle --no-tags -j"$(nproc)"
 
       - name: Detect kernel sublevel
-        working-directory: kernel_workspace
+        working-directory: kernel_workspace/common
         run: |
-          SUBLEVEL="$(grep -m1 '^SUBLEVEL = ' common/Makefile | awk '{print $3}')"
+          SUBLEVEL="$(grep -m1 '^SUBLEVEL = ' Makefile | awk '{print $3}')"
           echo "Detected SUBLEVEL: $SUBLEVEL"
           echo "SUBLEVEL=${SUBLEVEL}" >> "$GITHUB_ENV"
 
@@ -327,8 +327,16 @@ jobs:
           echo "CONFIG_NTSYNC=y" >> arch/arm64/configs/gki_defconfig
 
       - name: Build kernel
-        working-directory: kernel_workspace
+        working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
-          cd out/android12-5.10/common
-          make -j"$(nproc)" LLVM=1 LLVM_IAS=1 DEPMOD=depmod DTC=dtc O=/home/runner/work/Testing-why-build-is-failing-/Testing-why-build-is-failing-/kernel_workspace/out/android12-5.10/common
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CCACHE_DIR="${{ env.CCACHE_DIR }}"
+          export PATH="/usr/lib/ccache:$PATH"
+          
+          # Generate defconfig
+          make -j"$(nproc)" O="$(pwd)/out" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC=clang CLANG_TRIPLE=aarch64-linux-gnu- gki_defconfig
+          
+          # Build kernel
+          make -j"$(nproc)" O="$(pwd)/out" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC=clang CLANG_TRIPLE=aarch64-linux-gnu-
