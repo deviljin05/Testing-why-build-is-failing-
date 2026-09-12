@@ -1,50 +1,14 @@
-name: Build Custom GKI Kernel (SukiSU-Ultra + SUSFS + BBRv3)
-# ============================================================================
-# Fixed/verified version. Every external repo + patch path below was
-# checked against the real WildKernels/GKI_KernelSU_SUSFS build system.
-# Removed: WildPlusKernel/kernel_patches (doesn't exist), LZ4KD (not part
-# of this kernel family — no verified working source found, so dropped
-# rather than guessed), fake SKIP_DEFCONFIG_CHECK env var, silent `|| true`
-# swallowing on the actual SUSFS patch, manual KSU symlink hack.
-#
-# REVISION (this one): KernelSU-Next (pershoot/dev-susfs) replaced with
-# SukiSU-Ultra, using the `builtin` branch of its own setup.sh — the
-# officially-documented branch for manual SUSFS integration (matches
-# the manual susfs4ksu patch steps this workflow already applies).
-# Corrected from two earlier wrong guesses: `dev` (that's the manager
-# app's dev branch, not a valid kernel-integration branch for
-# setup.sh) and `susfs-main` (that branch has SUSFS already built in,
-# which would conflict with the manual susfs4ksu patches applied
-# earlier in this file). SUSFS source switched from simonpunk's
-# upstream susfs4ksu to ShirkNeko/susfs4ksu — a fork kept in sync
-# with SukiSU-Ultra by one community build system, though note a
-# separate build system (x3cl1Meero/zzh20188's) uses simonpunk's
-# original upstream directly with the `builtin` branch and that
-# combination is also confirmed working — either susfs4ksu source
-# should be fine paired with `builtin`. The old
-# "static.patch" fix step is removed: that patch targeted a bug specific
-# to the pershoot/KernelSU-Next fork and has nothing to do with the
-# SukiSU-Ultra codebase — applying it there would just fail/no-op.
-# CONFIG_KSU / CONFIG_KSU_SUSFS* defconfig names are unchanged since
-# SukiSU-Ultra is itself a KernelSU fork and keeps the same config
-# namespace.
-#
-# ADDED (prior revision): memory/storage optimization configs (KSM, CMA,
-# writeback tuning, F2FS/EXT4 tuning) + an in-kernel touch-boost driver
-# (input notifier → short freq_qos MIN boost on touch), wired the same
-# way as the existing SuiTune boot-boost/screen-off driver. Also added
-# IO scheduler forced to "none" (only mq-none built in, others disabled).
-# ============================================================================
+name: Build Custom GKI Kernel (ReSuKisu dev + SUSFS + BBRv3)
 
 on:
   workflow_dispatch:
     inputs:
       os_patch_level:
-        description: "Kernel branch tag — 'lts' tracks the rolling LTS branch (recommended, always current)"
+        description: "Kernel branch tag — 'lts' tracks the rolling LTS branch (recommended)"
         required: true
         default: "lts"
       susfs_commit:
-        description: "SUSFS commit hash (leave empty = latest on gki-android12-5.10 branch, i.e. latest SUSFS release)"
+        description: "SUSFS commit hash (leave empty = latest on gki-android12-5.10 branch)"
         required: false
         default: ""
       device_name:
@@ -52,7 +16,7 @@ on:
         required: false
         default: "gki-custom"
       enable_bbg:
-        description: "Enable Baseband Guard (BBG) — LSM that blocks unauthorized writes to modem/bootloader partitions, protects against brick from malicious root modules"
+        description: "Enable Baseband Guard (BBG)"
         required: true
         default: "true"
 
@@ -106,17 +70,16 @@ jobs:
           echo "Detected SUBLEVEL: $SUBLEVEL"
           echo "SUBLEVEL=${SUBLEVEL}" >> "$GITHUB_ENV"
 
-      - name: Clone SUSFS4KSU (ShirkNeko fork — kept in sync with SukiSU-Ultra)
+      - name: Clone SUSFS4KSU (simonpunk upstream)
         working-directory: kernel_workspace
         run: |
           set -euo pipefail
-          git clone https://github.com/ShirkNeko/susfs4ksu.git -b gki-android12-5.10 susfs4ksu
+          git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-android12-5.10 susfs4ksu
           cd susfs4ksu
           if [ -n "${{ github.event.inputs.susfs_commit }}" ]; then
             git checkout "${{ github.event.inputs.susfs_commit }}"
           fi
           echo "SUSFS_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
-          echo "SUSFS commit in use: $(git rev-parse HEAD) — $(git log -1 --format=%s)"
 
       - name: Set SUSFS kernel configs
         run: |
@@ -150,11 +113,11 @@ jobs:
         run: |
           set -euo pipefail
           if [ "${SUBLEVEL}" -le "43" ]; then
-            perl -i -pe 's/(int|size_t)\s+this_len\s*=\s*min_t\s*\(\s*\1\s*,/size_t this_len = min_t(size_t,/' fs/proc/base.c
+            perl -i -pe 's/(int|size_t)s+this_lens*=s*min_ts*(s*\u0001s*,/size_t this_len = min_t(size_t,/' fs/proc/base.c
           fi
           if [ "${SUBLEVEL}" -le "117" ]; then
-            sed -i '/^[[:space:]]*\/\*$/,/^[[:space:]]*u32 mask = mark->mask & IN_ALL_EVENTS;$/d' fs/notify/fdinfo.c
-            perl -i -pe 's/\bmask,\s*mark->ignored_mask/inotify_mark_user_mask(mark)/g' fs/notify/fdinfo.c
+            sed -i '/^[[:space:]]*/*$/,/^[[:space:]]*u32 mask = mark->mask & IN_ALL_EVENTS;$/d' fs/notify/fdinfo.c
+            perl -i -pe 's/\bmask,s*mark->ignored_mask/inotify_mark_user_mask(mark)/g' fs/notify/fdinfo.c
             perl -i -pe 's/ignored_mask:%x/ignored_mask:0/g' fs/notify/fdinfo.c
           fi
 
@@ -163,7 +126,7 @@ jobs:
         run: |
           set -euo pipefail
           if ! patch -p1 --fuzz=3 < 50_add_susfs_in_gki-android12-5.10.patch; then
-            echo "::error::SUSFS patch failed to apply cleanly — .rej files below:"
+            echo "::error::SUSFS patch failed to apply cleanly"
             find . -name "*.rej"
             exit 1
           fi
@@ -182,8 +145,15 @@ jobs:
             sed -i 's/^size_t this_len = min_t(size_t, count, PAGE_SIZE);$/int this_len = min_t(int, count, PAGE_SIZE);/' fs/proc/base.c
           fi
           if [ "${SUBLEVEL}" -le "117" ]; then
-            perl -i -pe 's/^(\s+if \(inode\) \{)/$1\n\t\t\/\*\n\t\t * IN_ALL_EVENTS represents all of the mask bits\n\t\t * that we expose to userspace.  There is at\n\t\t * least one bit (FS_EVENT_ON_CHILD) which is\n\t\t * used only internally to the kernel.\n\t\t *\/\n\t\tu32 mask = mark->mask & IN_ALL_EVENTS;/m' fs/notify/fdinfo.c
-            perl -i -pe 's/\binotify_mark_user_mask\(mark\)/mask, mark->ignored_mask/g' fs/notify/fdinfo.c
+            perl -i -pe 's/^(s+if (inode) {)/$1
+          \t\t/*
+           \t\t * IN_ALL_EVENTS represents all of the mask bits
+           \t\t * that we expose to userspace.  There is at
+            \t\t * least one bit (FS_EVENT_ON_CHILD) which is
+            \t\t * used only internally to the kernel.
+             \t\t */
+             \t\tu32 mask = mark->mask & IN_ALL_EVENTS;/m' fs/notify/fdinfo.c
+            perl -i -pe 's/\binotify_mark_user_mask(mark)/mask, mark->ignored_mask/g' fs/notify/fdinfo.c
             perl -i -pe 's/ignored_mask:0/ignored_mask:%x/g' fs/notify/fdinfo.c
           fi
 
@@ -194,20 +164,12 @@ jobs:
             sed -i -e 's/goto show_pad;/return 0;/' ./fs/proc/task_mmu.c
           fi
 
-      - name: Setup SukiSU-Ultra (builtin branch — manual SUSFS integration)
+      - name: Setup ReSuKisu (dev branch – latest testing)
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
-          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s builtin
-          echo "Contents after SukiSU-Ultra setup (verify the KernelSU dir name below matches what later steps expect):"
-          ls -d KernelSU* 2>/dev/null || echo "::warning::no KernelSU* directory found — check setup.sh output above for the actual path it created"
-
-      # NOTE: the old "Fix KernelSU-Next (static.patch)" step is intentionally
-      # removed here. That patch fixed a bug specific to the pershoot/KernelSU-Next
-      # fork's source layout and does not apply to the SukiSU-Ultra codebase.
-      # If your build later fails with a "static" / symbol redefinition error
-      # inside the KernelSU source, check SukiSU-Ultra's own issue tracker for
-      # the current fix rather than reapplying WildKernels' patch blindly.
+          curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/dev/kernel/setup.sh" | bash
+          ls -d KernelSU* 2>/dev/null || echo "::warning::no KernelSU* directory found"
 
       - name: Install Baseband Guard (BBG)
         if: ${{ github.event.inputs.enable_bbg == 'true' }}
@@ -232,7 +194,7 @@ jobs:
             echo "✓ BBG registered in common/security/Kconfig"
             grep -n "baseband_guard" common/security/Kconfig || true
           else
-            echo "::error::baseband_guard not found in common/security/Kconfig after setup — BBG install likely failed above"
+            echo "::error::baseband_guard not found in common/security/Kconfig after setup"
             exit 1
           fi
 
@@ -242,7 +204,6 @@ jobs:
         run: |
           BBG_COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
           echo "BBG_COMMIT=${BBG_COMMIT}" >> "$GITHUB_ENV"
-          echo "BBG commit: ${BBG_COMMIT}"
 
       - name: Enable BBG config
         if: ${{ github.event.inputs.enable_bbg == 'true' }}
@@ -258,11 +219,11 @@ jobs:
           BBRV3_PATCH="/tmp/wildpatches/common/bbrv3/0001-net-tcp-backport-BBRv3-to-android12-5.10.patch"
           if [ -f "$BBRV3_PATCH" ]; then
             patch -p1 < "$BBRV3_PATCH" || {
-              echo "::warning::BBRv3 patch had rejects — check .rej files below (BBR v1 config below still gives working TCP congestion control even if this fails)";
+              echo "::warning::BBRv3 patch had rejects";
               find . -name "*.rej";
             }
           else
-            echo "::warning::BBRv3 patch not found at expected path — repo structure may have changed. Skipping; BBR (v1) below still applies."
+            echo "::warning::BBRv3 patch not found at expected path"
           fi
 
           if ! grep -qF 'int proc_dou8vec_minmax(' ./include/linux/sysctl.h; then
@@ -327,13 +288,9 @@ jobs:
           set -euo pipefail
           if grep -q "int vm_dirty_ratio = 20;" mm/page-writeback.c; then
             sed -i 's/int vm_dirty_ratio = 20;/int vm_dirty_ratio = 10;/' mm/page-writeback.c
-          else
-            echo "::warning::vm_dirty_ratio default not found at expected line — left unchanged, can still be set at runtime via sysctl vm.dirty_ratio"
           fi
           if grep -q "unsigned int dirty_background_ratio = 10;" mm/page-writeback.c; then
             sed -i 's/unsigned int dirty_background_ratio = 10;/unsigned int dirty_background_ratio = 5;/' mm/page-writeback.c
-          else
-            echo "::warning::dirty_background_ratio default not found at expected line — left unchanged, can still be set at runtime via sysctl vm.dirty_background_ratio"
           fi
 
       - name: Set storage (F2FS/EXT4) optimization configs
@@ -356,529 +313,25 @@ jobs:
           if [ "${SUBLEVEL}" -le "208" ]; then
             curl -LSs -o /tmp/0003-lockdep-assert-none-held.patch \
               https://raw.githubusercontent.com/WildKernels/GKI_KernelSU_SUSFS/main/.github/actions/ntsync/patches/0003-lockdep-assert-none-held.patch
-            patch -p1 -N < /tmp/0003-lockdep-assert-none-held.patch || echo "::warning::lockdep fix did not apply — may already be present"
+            patch -p1 -N < /tmp/0003-lockdep-assert-none-held.patch || echo "::warning::lockdep fix did not apply"
           fi
 
           curl -LSs -o /tmp/ntsync_compat_android12-5.10.patch \
             https://raw.githubusercontent.com/WildKernels/kernel_patches/main/common/ntsync/ntsync_compat_android12-5.10.patch
-          patch -p1 < /tmp/ntsync_compat_android12-5.10.patch || echo "::warning::ntsync compat patch had rejects — check .rej"
+          patch -p1 < /tmp/ntsync_compat_android12-5.10.patch || echo "::warning::ntsync compat patch had rejects"
 
           curl -LSs -o /tmp/ntsync_base.patch \
             https://raw.githubusercontent.com/WildKernels/kernel_patches/main/common/ntsync/ntsync_base.patch
-          patch -p1 < /tmp/ntsync_base.patch || echo "::warning::ntsync base patch had rejects — check .rej"
+          patch -p1 < /tmp/ntsync_base.patch || echo "::warning::ntsync base patch had rejects"
 
           echo "CONFIG_NTSYNC=y" >> arch/arm64/configs/gki_defconfig
-
-      - name: Set gaming/scheduler configs (300Hz timer, SCHED_MC)
-        run: |
-          cd kernel_workspace/common/arch/arm64/configs
-          {
-            echo "CONFIG_HZ_300=y"
-            echo "CONFIG_HZ=300"
-            echo "CONFIG_SCHED_MC=y"
-            echo "CONFIG_CPU_FREQ_DEFAULT_GOV_SCHEDUTIL=y"
-            echo "CONFIG_CPU_FREQ_GOV_SCHEDUTIL=y"
-          } >> gki_defconfig
-
-      - name: Add Zenith custom gaming CPU governor
-        working-directory: kernel_workspace/common
-        run: |
-          set -euo pipefail
-          cat > drivers/cpufreq/cpufreq_zenith.c << 'ZENITH_EOF'
-          /*
-           * cpufreq_zenith.c — custom gaming-oriented cpufreq governor.
-           *
-           * Aggressive up-scaling (jump to max on load spike) with a
-           * short debounce on the way back down, aimed at reducing
-           * input-to-frame latency in games at some cost to battery life.
-           * Not an upstream governor — written for this build.
-           */
-
-          #include <linux/cpufreq.h>
-          #include <linux/init.h>
-          #include <linux/kernel.h>
-          #include <linux/module.h>
-          #include <linux/mutex.h>
-          #include <linux/slab.h>
-          #include <linux/tick.h>
-          #include <linux/workqueue.h>
-
-          #define ZENITH_SAMPLE_MS 10
-
-          struct zenith_tunables {
-          	unsigned int up_threshold;
-          	unsigned int down_threshold;
-          	unsigned int down_debounce;
-          	unsigned int down_step_pct;
-          };
-
-          static const struct zenith_tunables zenith_perf = {
-          	.up_threshold   = 55,
-          	.down_threshold = 25,
-          	.down_debounce  = 4,
-          	.down_step_pct  = 20,
-          };
-
-          static const struct zenith_tunables zenith_eff = {
-          	.up_threshold   = 75,
-          	.down_threshold = 35,
-          	.down_debounce  = 6,
-          	.down_step_pct  = 10,
-          };
-
-          struct zenith_cpu_dbs {
-          	struct cpufreq_policy *policy;
-          	struct delayed_work work;
-          	const struct zenith_tunables *tunables;
-          	u64 prev_idle;
-          	u64 prev_wall;
-          	unsigned int down_streak;
-          	struct mutex lock;
-          	bool active;
-          };
-
-          static DEFINE_PER_CPU(struct zenith_cpu_dbs, zenith_dbs);
-
-          static unsigned int zenith_global_max_freq;
-          static DEFINE_MUTEX(zenith_global_lock);
-
-          static const struct zenith_tunables *zenith_classify(struct cpufreq_policy *policy)
-          {
-          	unsigned int cpu, max_seen = 0;
-          	struct cpufreq_policy *p;
-
-          	mutex_lock(&zenith_global_lock);
-          	for_each_possible_cpu(cpu) {
-          		p = cpufreq_cpu_get(cpu);
-          		if (!p)
-          			continue;
-          		if (p->cpuinfo.max_freq > max_seen)
-          			max_seen = p->cpuinfo.max_freq;
-          		cpufreq_cpu_put(p);
-          	}
-          	if (max_seen > zenith_global_max_freq)
-          		zenith_global_max_freq = max_seen;
-          	mutex_unlock(&zenith_global_lock);
-
-          	return (policy->cpuinfo.max_freq >= zenith_global_max_freq)
-          	       ? &zenith_perf : &zenith_eff;
-          }
-
-          static unsigned int zenith_load_percent(struct zenith_cpu_dbs *dbs, int cpu)
-          {
-          	u64 idle, wall, idle_delta, wall_delta;
-          	unsigned int load;
-
-          	idle = get_cpu_idle_time(cpu, &wall, 0);
-          	wall_delta = wall - dbs->prev_wall;
-          	idle_delta = idle - dbs->prev_idle;
-          	dbs->prev_wall = wall;
-          	dbs->prev_idle = idle;
-
-          	if (!wall_delta)
-          		return 0;
-          	if (idle_delta > wall_delta)
-          		idle_delta = wall_delta;
-
-          	load = 100 * (wall_delta - idle_delta);
-          	do_div(load, wall_delta);
-          	return load;
-          }
-
-          static void zenith_work_fn(struct work_struct *work)
-          {
-          	struct zenith_cpu_dbs *dbs =
-          		container_of(to_delayed_work(work), struct zenith_cpu_dbs, work);
-          	const struct zenith_tunables *t;
-          	struct cpufreq_policy *policy;
-          	unsigned int load, target, range, step;
-          	int cpu;
-
-          	mutex_lock(&dbs->lock);
-          	if (!dbs->active) {
-          		mutex_unlock(&dbs->lock);
-          		return;
-          	}
-          	policy = dbs->policy;
-          	t = dbs->tunables;
-          	cpu = policy->cpu;
-          	load = zenith_load_percent(dbs, cpu);
-
-          	if (load >= t->up_threshold) {
-          		dbs->down_streak = 0;
-          		if (policy->cur != policy->max)
-          			__cpufreq_driver_target(policy, policy->max,
-          						 CPUFREQ_RELATION_H);
-          	} else if (load <= t->down_threshold) {
-          		dbs->down_streak++;
-          		if (dbs->down_streak >= t->down_debounce) {
-          			dbs->down_streak = 0;
-          			range = policy->max - policy->min;
-          			step = (range * t->down_step_pct) / 100;
-          			if (step == 0)
-          				step = 1;
-          			target = policy->cur > (policy->min + step)
-          				 ? policy->cur - step : policy->min;
-          			__cpufreq_driver_target(policy, target,
-          						 CPUFREQ_RELATION_L);
-          		}
-          	} else {
-          		dbs->down_streak = 0;
-          	}
-
-          	schedule_delayed_work_on(cpu, &dbs->work,
-          				  msecs_to_jiffies(ZENITH_SAMPLE_MS));
-          	mutex_unlock(&dbs->lock);
-          }
-
-          static int zenith_governor_start(struct cpufreq_policy *policy)
-          {
-          	struct zenith_cpu_dbs *dbs = &per_cpu(zenith_dbs, policy->cpu);
-
-          	mutex_init(&dbs->lock);
-          	dbs->policy = policy;
-          	dbs->tunables = zenith_classify(policy);
-          	dbs->down_streak = 0;
-          	dbs->prev_idle = get_cpu_idle_time(policy->cpu, &dbs->prev_wall, 0);
-          	dbs->active = true;
-
-          	INIT_DELAYED_WORK(&dbs->work, zenith_work_fn);
-          	schedule_delayed_work_on(policy->cpu, &dbs->work,
-          				  msecs_to_jiffies(ZENITH_SAMPLE_MS));
-          	return 0;
-          }
-
-          static void zenith_governor_stop(struct cpufreq_policy *policy)
-          {
-          	struct zenith_cpu_dbs *dbs = &per_cpu(zenith_dbs, policy->cpu);
-
-          	mutex_lock(&dbs->lock);
-          	dbs->active = false;
-          	mutex_unlock(&dbs->lock);
-          	cancel_delayed_work_sync(&dbs->work);
-          }
-
-          static void zenith_governor_limits(struct cpufreq_policy *policy)
-          {
-          	if (policy->cur < policy->min)
-          		__cpufreq_driver_target(policy, policy->min, CPUFREQ_RELATION_L);
-          	else if (policy->cur > policy->max)
-          		__cpufreq_driver_target(policy, policy->max, CPUFREQ_RELATION_H);
-          }
-
-          static struct cpufreq_governor zenith_gov = {
-          	.name		= "zenith",
-          	.owner		= THIS_MODULE,
-          	.flags		= CPUFREQ_GOV_DYNAMIC_SWITCHING,
-          	.start		= zenith_governor_start,
-          	.stop		= zenith_governor_stop,
-          	.limits		= zenith_governor_limits,
-          };
-
-          cpufreq_governor_init(zenith_gov);
-          cpufreq_governor_exit(zenith_gov);
-
-          MODULE_LICENSE("GPL");
-          MODULE_DESCRIPTION("Zenith: aggressive gaming-oriented cpufreq governor");
-          ZENITH_EOF
-
-          if ! grep -q "CPU_FREQ_GOV_ZENITH" drivers/cpufreq/Kconfig; then
-            sed -i '/^config CPU_FREQ_GOV_SCHEDUTIL/i \
-          config CPU_FREQ_GOV_ZENITH\n\ttristate "zenith"\n\thelp\n\t  Custom gaming-oriented governor.\n\n\t  If in doubt, say N.\n' drivers/cpufreq/Kconfig
-          fi
-
-          if ! grep -q "cpufreq_zenith" drivers/cpufreq/Makefile; then
-            echo 'obj-$(CONFIG_CPU_FREQ_GOV_ZENITH)	+= cpufreq_zenith.o' >> drivers/cpufreq/Makefile
-          fi
-
-          echo "CONFIG_CPU_FREQ_GOV_ZENITH=y" >> arch/arm64/configs/gki_defconfig
-
-      - name: Set default swappiness to 30 in source
-        working-directory: kernel_workspace/common
-        run: |
-          set -euo pipefail
-          if grep -q "int vm_swappiness = 60;" mm/vmscan.c; then
-            sed -i 's/int vm_swappiness = 60;/int vm_swappiness = 30;/' mm/vmscan.c
-          fi
-
-      - name: Add SuiTune in-kernel driver (boot boost + screen-off min-freq + touch boost)
-        working-directory: kernel_workspace/common
-        run: |
-          set -euo pipefail
-          cat > drivers/misc/suitune.c << 'SUITUNE_EOF'
-          #include <linux/module.h>
-          #include <linux/kernel.h>
-          #include <linux/init.h>
-          #include <linux/cpufreq.h>
-          #include <linux/pm_qos.h>
-          #include <linux/fb.h>
-          #include <linux/notifier.h>
-          #include <linux/workqueue.h>
-          #include <linux/cpu.h>
-          #include <linux/cpumask.h>
-          #include <linux/input.h>
-          #include <linux/slab.h>
-
-          #define SUITUNE_BOOST_MS (60 * 1000)
-          #define SUITUNE_TOUCH_BOOST_MS 250
-
-          static struct freq_qos_request boost_reqs[NR_CPUS];
-          static struct freq_qos_request screenoff_reqs[NR_CPUS];
-          static struct freq_qos_request touch_reqs[NR_CPUS];
-          static bool boost_active[NR_CPUS];
-          static bool screenoff_active[NR_CPUS];
-          static bool touch_active[NR_CPUS];
-
-          static void suitune_boost_end(struct work_struct *work);
-          static DECLARE_DELAYED_WORK(suitune_boost_work, suitune_boost_end);
-
-          static void suitune_touch_boost_end(struct work_struct *work);
-          static DECLARE_DELAYED_WORK(suitune_touch_boost_work, suitune_touch_boost_end);
-
-          static void suitune_apply_boot_boost(void)
-          {
-          	unsigned int cpu;
-          	struct cpufreq_policy *policy;
-
-          	for_each_possible_cpu(cpu) {
-          		policy = cpufreq_cpu_get(cpu);
-          		if (!policy)
-          			continue;
-          		if (!freq_qos_add_request(&policy->constraints,
-          					   &boost_reqs[cpu], FREQ_QOS_MIN,
-          					   policy->cpuinfo.max_freq))
-          			boost_active[cpu] = true;
-          		cpufreq_cpu_put(policy);
-          	}
-          	schedule_delayed_work(&suitune_boost_work,
-          			      msecs_to_jiffies(SUITUNE_BOOST_MS));
-          }
-
-          static void suitune_boost_end(struct work_struct *work)
-          {
-          	unsigned int cpu;
-
-          	for_each_possible_cpu(cpu) {
-          		if (boost_active[cpu]) {
-          			freq_qos_remove_request(&boost_reqs[cpu]);
-          			boost_active[cpu] = false;
-          		}
-          	}
-          }
-
-          static int suitune_fb_notifier_callback(struct notifier_block *self,
-          					 unsigned long event, void *data)
-          {
-          	struct fb_event *evdata = data;
-          	unsigned int cpu;
-          	struct cpufreq_policy *policy;
-          	int blank;
-
-          	if (event != FB_EVENT_BLANK || !evdata || !evdata->data)
-          		return NOTIFY_OK;
-
-          	blank = *(int *)evdata->data;
-
-          	if (blank == FB_BLANK_POWERDOWN) {
-          		for_each_possible_cpu(cpu) {
-          			policy = cpufreq_cpu_get(cpu);
-          			if (!policy)
-          				continue;
-          			if (!screenoff_active[cpu]) {
-          				if (!freq_qos_add_request(&policy->constraints,
-          							   &screenoff_reqs[cpu],
-          							   FREQ_QOS_MAX,
-          							   policy->cpuinfo.min_freq))
-          					screenoff_active[cpu] = true;
-          			}
-          			cpufreq_cpu_put(policy);
-          		}
-          	} else if (blank == FB_BLANK_UNBLANK) {
-          		for_each_possible_cpu(cpu) {
-          			if (screenoff_active[cpu]) {
-          				freq_qos_remove_request(&screenoff_reqs[cpu]);
-          				screenoff_active[cpu] = false;
-          			}
-          		}
-          	}
-          	return NOTIFY_OK;
-          }
-
-          static struct notifier_block suitune_fb_notif = {
-          	.notifier_call = suitune_fb_notifier_callback,
-          };
-
-          static void suitune_touch_boost_start(void)
-          {
-          	unsigned int cpu;
-          	struct cpufreq_policy *policy;
-          	unsigned int target;
-
-          	for_each_possible_cpu(cpu) {
-          		policy = cpufreq_cpu_get(cpu);
-          		if (!policy)
-          			continue;
-          		target = policy->cpuinfo.max_freq;
-          		if (!touch_active[cpu]) {
-          			if (!freq_qos_add_request(&policy->constraints,
-          						   &touch_reqs[cpu],
-          						   FREQ_QOS_MIN, target))
-          				touch_active[cpu] = true;
-          		} else {
-          			freq_qos_update_request(&touch_reqs[cpu], target);
-          		}
-          		cpufreq_cpu_put(policy);
-          	}
-          	mod_delayed_work(system_wq, &suitune_touch_boost_work,
-          			  msecs_to_jiffies(SUITUNE_TOUCH_BOOST_MS));
-          }
-
-          static void suitune_touch_boost_end(struct work_struct *work)
-          {
-          	unsigned int cpu;
-
-          	for_each_possible_cpu(cpu) {
-          		if (touch_active[cpu]) {
-          			freq_qos_remove_request(&touch_reqs[cpu]);
-          			touch_active[cpu] = false;
-          		}
-          	}
-          }
-
-          static void suitune_input_event(struct input_handle *handle,
-          				 unsigned int type, unsigned int code,
-          				 int value)
-          {
-          	if (type == EV_KEY && code == BTN_TOUCH && value == 1)
-          		suitune_touch_boost_start();
-          	else if (type == EV_ABS)
-          		suitune_touch_boost_start();
-          }
-
-          static int suitune_input_connect(struct input_handler *handler,
-          				   struct input_dev *dev,
-          				   const struct input_device_id *id)
-          {
-          	struct input_handle *handle;
-          	int error;
-
-          	handle = kzalloc(sizeof(*handle), GFP_KERNEL);
-          	if (!handle)
-          		return -ENOMEM;
-
-          	handle->dev = dev;
-          	handle->handler = handler;
-          	handle->name = "suitune_touchboost";
-
-          	error = input_register_handle(handle);
-          	if (error)
-          		goto err_free;
-
-          	error = input_open_device(handle);
-          	if (error)
-          		goto err_unregister;
-
-          	return 0;
-
-          err_unregister:
-          	input_unregister_handle(handle);
-          err_free:
-          	kfree(handle);
-          	return error;
-          }
-
-          static void suitune_input_disconnect(struct input_handle *handle)
-          {
-          	input_close_device(handle);
-          	input_unregister_handle(handle);
-          	kfree(handle);
-          }
-
-          static const struct input_device_id suitune_input_ids[] = {
-          	{
-          		.flags = INPUT_DEVICE_ID_MATCH_EVBIT |
-          			 INPUT_DEVICE_ID_MATCH_KEYBIT,
-          		.evbit = { BIT_MASK(EV_ABS) },
-          		.keybit = { [BIT_WORD(BTN_TOUCH)] = BIT_MASK(BTN_TOUCH) },
-          	},
-          	{ },
-          };
-          MODULE_DEVICE_TABLE(input, suitune_input_ids);
-
-          static struct input_handler suitune_input_handler = {
-          	.event = suitune_input_event,
-          	.connect = suitune_input_connect,
-          	.disconnect = suitune_input_disconnect,
-          	.name = "suitune_touchboost",
-          	.id_table = suitune_input_ids,
-          };
-
-          static int __init suitune_init(void)
-          {
-          	int ret;
-
-          	fb_register_client(&suitune_fb_notif);
-          	suitune_apply_boot_boost();
-
-          	ret = input_register_handler(&suitune_input_handler);
-          	if (ret)
-          		pr_warn("suitune: touch-boost input handler registration failed (%d)\n", ret);
-
-          	return 0;
-          }
-
-          late_initcall(suitune_init);
-
-          MODULE_LICENSE("GPL");
-          MODULE_DESCRIPTION("SuiTune: in-kernel boot boost + screen-off min-freq cap + touch boost");
-          SUITUNE_EOF
-
-          if ! grep -q "config SUITUNE" drivers/misc/Kconfig; then
-            sed -i '/^endmenu/i \
-          config SUITUNE\n\tbool "SuiTune: boot CPU boost + screen-off min-freq cap + touch boost"\n\tdepends on CPU_FREQ \&\& FB \&\& INPUT\n\tdefault y\n' drivers/misc/Kconfig
-          fi
-          if ! grep -q "CONFIG_SUITUNE" drivers/misc/Makefile; then
-            echo 'obj-$(CONFIG_SUITUNE) += suitune.o' >> drivers/misc/Makefile
-          fi
-          echo "CONFIG_SUITUNE=y" >> arch/arm64/configs/gki_defconfig
-
-      - name: Clean dirty flag
-        working-directory: kernel_workspace
-        run: |
-          set -euo pipefail
-          sed -i 's/-dirty//' common/scripts/setlocalversion
-          cd common
-          git add -A
-          git -c user.name="github-actions[bot]" -c user.email="github-actions[bot]@users.noreply.github.com" \
-            commit -m "Clean dirty flag" --allow-empty -q
-
-      - name: Apply custom kernel branding
-        working-directory: kernel_workspace/common
-        run: |
-          set -euo pipefail
-          mv scripts/setlocalversion scripts/setlocalversion.orig
-          chmod +x scripts/setlocalversion.orig
-          cat > scripts/setlocalversion << 'SETLOCALVERSION_EOF'
-          #!/bin/sh
-          printf -- '-BLAZE-STABLE\n'
-          SETLOCALVERSION_EOF
-          chmod +x scripts/setlocalversion
-
-      - name: Disable strict defconfig verification
-        working-directory: kernel_workspace
-        run: sed -i 's/check_defconfig//' ./common/build.config.gki
 
       - name: Build kernel
         working-directory: kernel_workspace
         run: |
           set -euo pipefail
-          export KBUILD_BUILD_USER="builder"
-          export KBUILD_BUILD_HOST="ci"
-          LTO=thin \
-          BUILD_CONFIG=common/build.config.gki.aarch64 \
-          USE_CCACHE=1 \
-          CCACHE_DIR="${{ env.CCACHE_DIR }}" \
-          build/build.sh -j"$(nproc)"
+          cd out/android12-5.10/common
+          make -j"$(nproc)" LLVM=1 LLVM_IAS=1 DEPMOD=depmod DTC=dtc O=/home/runner/work/Testing-why-build-is-failing-/Testing-why-build-is-failing-/kernel_workspace/out/android12-5.10/common
 
       - name: Locate built Image
         working-directory: kernel_workspace
